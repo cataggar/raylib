@@ -101,6 +101,61 @@ raylib is also available via multiple package managers on multiple OS distributi
 
 *Note that the Wiki is open for edit, if you find some issues while building raylib for your target platform, feel free to edit the Wiki or open an issue related to it.*
 
+#### Building with Zig
+
+The Zig package requires Zig 0.17.0 and retains the raylib 6.0 C API.
+`zig build` installs the library, headers, and desktop examples.
+`zig build examples` builds all example groups, and `zig build test` tests
+the build helpers. `zig build test-modules` checks the translated camera and
+math modules, running their headless tests on a matching native target.
+Existing backend, graphics, linkage, and feature options
+remain available through `zig build --help`.
+
+Android builds use `-Dplatform=android`, an Android target such as
+`-Dtarget=aarch64-linux-android`, and an NDK directory supplied through
+`-Dandroid_ndk` or `ANDROID_NDK_HOME`. `-Dandroid_api_version` still defaults
+to `35`; generated libc metadata follows the selected ABI and API level.
+The Android library records its `android`, `log`, `EGL`, and `GLESv2` link
+dependencies. Android examples build PIC shared NativeActivity libraries
+with the selected NDK's real `android_native_app_glue.c`, retain
+`ANativeActivity_onCreate`, and require a fully resolved final link. They
+install under `android/<abi>/<group>/lib<example>.so`; an individual example
+step builds and installs its library rather than attempting to execute it
+on the host. The selected raylib static/shared linkage remains independent
+of the NativeActivity library's shared linkage. The activity directly links
+`android` and `log` for native-app-glue, including with shared raylib.
+
+Final Android links also require true `--wrap=fopen` semantics for APK asset
+loading. The current Zig driver does not expose that linker option, so the
+shared-link compiler boundary remains visible; no alias or undefined-symbol
+allowance substitutes for wrapping. Native linker and other compiler
+diagnostics also remain unwaived. This graph does not
+assemble, sign, install, or launch an APK.
+
+The Zig project template uses a typed C-ABI adapter on Android to call its
+unchanged program after raylib initializes the NativeActivity state. The
+retained OpenGL interop example uses real GLES2 declarations and raylib's
+context-loaded OES VAO helpers on Android. If VAOs are unavailable, it
+binds the same particle VBO and vertex attribute explicitly for each draw.
+Context, required GLSL100 shader, and buffer failures are reported rather
+than treating a missing feature as a working demo. Desktop and Web paths
+are unchanged; source compilation alone does not qualify Android runtime.
+
+The NativeActivity final link requests `-z defs`; the current native linker
+can nevertheless emit a shared library with unresolved `__real_fopen`.
+A successful command is therefore not proof of a fully resolved or
+loadable Android library. Final ELF and runtime acceptance remain separate
+from build-graph and native-host regression checks.
+The exported `raylib`, `rcamera`, `raymath`, and `rlgl` modules and optional
+raygui integration remain available. Web examples retain their
+`web/<group>/<example>` directories and `emrun` entrypoints.
+
+| Zig build dependency | Version | Revision |
+| --- | --- | --- |
+| zemscripten (default-output, 3fa4 generation) | 0.2.0-dev | `41f772b0fb097b25340103cd6ce3c49c855e9a69` |
+| translate-c | 2.0.0 | `62d06a5d3e93c82727544e8113e4762a315ca0ed` |
+| Aro (via translate-c) | 0.0.0 | `d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b` |
+
 #### Setup raylib with multiple IDEs
 
 raylib has been developed on Windows platform using [Notepad++](https://notepad-plus-plus.org/) and [MinGW GCC](https://www.mingw-w64.org/) compiler but it can be used with other IDEs on multiple platforms.

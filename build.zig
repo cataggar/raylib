@@ -1,5 +1,135 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const Translator = @import("translate_c").Translator;
+
+pub const android = struct {
+    pub fn addNativeActivity(
+        b: *std.Build,
+        name: []const u8,
+        module: *std.Build.Module,
+        raylib: *std.Build.Step.Compile,
+        ndk_path: []const u8,
+    ) *std.Build.Step.Compile {
+        if (!module.resolved_target.?.result.abi.isAndroid()) @panic("NativeActivity requires an Android target");
+        if (ndk_path.len == 0) @panic("NativeActivity requires an Android NDK path");
+
+        const glue_dir = b.pathJoin(&.{ ndk_path, "sources/android/native_app_glue" });
+        module.pic = true;
+        module.link_libc = true;
+        module.addCMacro("PLATFORM_ANDROID", "");
+        module.addSystemIncludePath(.{ .cwd_relative = glue_dir });
+        module.addCSourceFile(.{
+            .file = .{ .cwd_relative = b.pathJoin(&.{ glue_dir, "android_native_app_glue.c" }) },
+            .flags = &.{"-std=c99"},
+        });
+        module.linkLibrary(raylib);
+        module.linkSystemLibrary("android", .{});
+        module.linkSystemLibrary("log", .{});
+        for (raylib.root_module.lib_paths.items) |library_path| {
+            module.addLibraryPath(library_path);
+        }
+
+        const activity = b.addLibrary(.{
+            .name = name,
+            .linkage = .dynamic,
+            .root_module = module,
+            .use_lld = false,
+        });
+        activity.setLibCFile(raylib.libc_file);
+        activity.forceUndefinedSymbol("ANativeActivity_onCreate");
+        activity.link_z_defs = true;
+        activity.linker_allow_shlib_undefined = false;
+        return activity;
+    }
+
+    pub fn installNativeActivity(
+        b: *std.Build,
+        activity: *std.Build.Step.Compile,
+        group: []const u8,
+    ) *std.Build.Step.InstallArtifact {
+        const abi_dir = switch (activity.root_module.resolved_target.?.result.cpu.arch) {
+            .x86 => "x86",
+            .x86_64 => "x86_64",
+            .arm => "armeabi-v7a",
+            .aarch64 => "arm64-v8a",
+            .riscv64 => "riscv64",
+            else => @panic("unsupported Android ABI"),
+        };
+        return b.addInstallArtifact(activity, .{
+            .dest_dir = .{ .override = .{ .custom = b.pathJoin(&.{ "android", abi_dir, group }) } },
+            .dest_sub_path = activity.out_filename,
+        });
+    }
+};
+
+test "NativeActivity graph links real glue and retains the loader entry across Android ABIs" {
+    // Inspect graph nodes only; the modeled SDK paths are never compiled or linked.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const host: std.Build.ResolvedTarget = .{
+        .query = .{},
+        .result = try std.zig.system.resolveTargetQuery(std.testing.io, .{}),
+    };
+    var graph: std.Build.Graph = .{
+        .io = std.testing.io,
+        .arena = allocator,
+        .zig_exe = "zig",
+        .environ_map = .init(allocator),
+        .host = host,
+        .generated_files = .empty,
+        .wip_configuration = .{ .gpa = allocator },
+    };
+    const b = try std.Build.create(&graph, .cwd(), &.{});
+    for ([_]std.Target.Cpu.Arch{ .x86, .x86_64, .arm, .aarch64 }, [_][]const u8{
+        "x86", "x86_64", "armeabi-v7a", "arm64-v8a",
+    }) |arch, abi_dir| {
+        const query: std.Target.Query = .{
+            .cpu_arch = arch,
+            .os_tag = .linux,
+            .abi = if (arch == .arm) .androideabi else .android,
+        };
+        const target: std.Build.ResolvedTarget = .{
+            .query = query,
+            .result = try std.zig.system.resolveTargetQuery(std.testing.io, query),
+        };
+        for ([_]std.builtin.LinkMode{ .static, .dynamic }) |linkage| {
+            const raylib = b.addLibrary(.{
+                .name = "raylib",
+                .linkage = linkage,
+                .root_module = b.createModule(.{ .target = target, .optimize = .Debug }),
+            });
+            raylib.root_module.addLibraryPath(.{ .cwd_relative = "ndk/usr/lib/35" });
+            raylib.setLibCFile(.{ .cwd_relative = "android-libc.txt" });
+            const module = b.createModule(.{ .target = target, .optimize = .Debug });
+            const activity = android.addNativeActivity(b, "native-test", module, raylib, "ndk");
+            try std.testing.expectEqual(std.Build.Step.Compile.Kind.lib, activity.kind);
+            try std.testing.expectEqual(std.builtin.LinkMode.dynamic, activity.linkage.?);
+            try std.testing.expect(module.pic.?);
+            try std.testing.expect(activity.link_z_defs);
+            try std.testing.expect(!activity.linker_allow_shlib_undefined.?);
+            try std.testing.expect(activity.force_undefined_symbols.contains("ANativeActivity_onCreate"));
+            try std.testing.expectEqualStrings("android-libc.txt", activity.libc_file.?.cwd_relative);
+            try std.testing.expectEqualStrings("ndk/usr/lib/35", module.lib_paths.items[0].cwd_relative);
+            var found_glue = false;
+            var found_android = false;
+            var found_log = false;
+            for (module.link_objects.items) |object| {
+                if (object == .c_source_file) {
+                    found_glue = std.mem.eql(u8, object.c_source_file.file.cwd_relative, "ndk/sources/android/native_app_glue/android_native_app_glue.c");
+                } else if (object == .system_lib) {
+                    found_android = found_android or std.mem.eql(u8, object.system_lib.name, "android");
+                    found_log = found_log or std.mem.eql(u8, object.system_lib.name, "log");
+                }
+            }
+            try std.testing.expect(found_glue);
+            try std.testing.expect(found_android and found_log);
+            const install = android.installNativeActivity(b, activity, "core");
+            try std.testing.expectEqualStrings(b.pathJoin(&.{ "android", abi_dir, "core" }), install.dest_dir.?.custom);
+            try std.testing.expectEqualStrings("libnative-test.so", install.dest_sub_path.?);
+        }
+    }
+}
 
 pub const emsdk = struct {
     const zemscripten = @import("zemscripten");
@@ -77,7 +207,7 @@ pub const emsdk = struct {
 
     pub fn emrunStep(
         b: *std.Build,
-        html_path: []const u8,
+        html_path: anytype,
         extra_args: []const []const u8,
     ) *std.Build.Step {
         return zemscripten.emrunStep(b, html_path, extra_args);
@@ -92,13 +222,55 @@ pub fn linkWindows(mod: *std.Build.Module, opengl: bool, comptime shcore: bool) 
 }
 
 fn findWaylandScanner(b: *std.Build) void {
-    _ = b.findProgram(&.{"wayland-scanner"}, &.{}) catch {
+    _ = b.findProgram(.{ .names = &.{"wayland-scanner"} }) orelse {
         std.log.err(
             \\ `wayland-scanner` may not be installed on the system.
             \\ You can switch to X11 in your `build.zig` by changing `Options.linux_display_backend`
         , .{});
         @panic("`wayland-scanner` not found");
     };
+}
+
+fn androidLibCContents(allocator: std.mem.Allocator, include_path: []const u8, arch_include_path: []const u8, api_lib_path: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    try (std.zig.LibCInstallation{
+        .include_dir = include_path,
+        .sys_include_dir = arch_include_path,
+        .cc_dir = api_lib_path,
+        .crt_dir = api_lib_path,
+    }).render(&writer.writer);
+    return writer.toOwnedSlice();
+}
+
+test "Android libc metadata preserves the selected ABI and API" {
+    const filename = "raylib-libc-test.conf";
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, filename) catch {};
+    for ([_]std.Target.Cpu.Arch{ .x86, .x86_64, .arm, .aarch64 }, [_][]const u8{
+        "i686-linux-android",
+        "x86_64-linux-android",
+        "arm-linux-androideabi",
+        "aarch64-linux-android",
+    }) |arch, triple| {
+        const arch_include_path = try std.fs.path.join(std.testing.allocator, &.{ "ndk/usr/include", triple });
+        defer std.testing.allocator.free(arch_include_path);
+        const api_lib_path = try std.fs.path.join(std.testing.allocator, &.{ "ndk/usr/lib", triple, "35" });
+        defer std.testing.allocator.free(api_lib_path);
+        const contents = try androidLibCContents(std.testing.allocator, "ndk/usr/include", arch_include_path, api_lib_path);
+        defer std.testing.allocator.free(contents);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = filename, .data = contents });
+        const target = try std.zig.system.resolveTargetQuery(std.testing.io, .{
+            .cpu_arch = arch,
+            .os_tag = .linux,
+            .abi = if (arch == .arm) .androideabi else .android,
+        });
+        var installation = try std.zig.LibCInstallation.parse(std.testing.allocator, std.testing.io, filename, &target);
+        defer installation.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("ndk/usr/include", installation.include_dir.?);
+        try std.testing.expectEqualStrings(arch_include_path, installation.sys_include_dir.?);
+        try std.testing.expectEqualStrings(api_lib_path, installation.crt_dir.?);
+        try std.testing.expectEqualStrings(api_lib_path, installation.cc_dir.?);
+    }
 }
 
 pub fn linkLinux(mod: *std.Build.Module, comptime display_backend: LinuxDisplayBackend) void {
@@ -407,7 +579,10 @@ fn compileRaylib(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
             }
 
             raylib_mod.addCMacro("PLATFORM_ANDROID", "");
+            raylib_mod.pic = true;
 
+            raylib_mod.linkSystemLibrary("android", .{});
+            raylib_mod.linkSystemLibrary("log", .{});
             raylib_mod.linkSystemLibrary("EGL", .{});
             switch (options.opengl_version) {
                 .auto, .gles_2 => {
@@ -452,16 +627,7 @@ fn compileRaylib(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
             raylib_mod.addSystemIncludePath(.{ .cwd_relative = androidAsmPath });
             raylib_mod.addSystemIncludePath(.{ .cwd_relative = androidGluePath });
 
-            const libc_data = try std.fmt.allocPrint(b.allocator,
-                \\include_dir={0s}/sysroot/usr/include
-                \\sys_include_dir={0s}/sysroot/usr/include/aarch64-linux-android
-                \\crt_dir={0s}/sysroot/usr/lib/aarch64-linux-android/24
-                \\static_lib_dir={0s}/sysroot/usr/lib/aarch64-linux-android/24
-                \\msvc_lib_dir=
-                \\kernel32_lib_dir=
-                \\gcc_dir=
-                \\
-            , .{androidNdkPathString});
+            const libc_data = try androidLibCContents(b.allocator, androidIncludePath, androidArchIncludePath, androidApiSpecificPath);
             const write_step = b.addWriteFiles();
             const libcFile = write_step.add("android-libc.txt", libc_data);
             raylib.setLibCFile(libcFile);
@@ -492,14 +658,15 @@ fn addRaygui(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
 
         raylib.installHeader(raygui_dep.path("src/raygui.h"), "raygui.h");
 
-        const c = b.addTranslateC(.{
-            .root_source_file = raygui_dep.path("src/raygui.h"),
+        const c: Translator = .init(b.dependency("translate_c", .{}), .{
+            .c_source_file = raygui_dep.path("src/raygui.h"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .libc_file = raylib.libc_file,
         });
         c.addIncludePath(b.path("src"));
-        const c_mod = c.createModule();
+        const c_mod = c.mod;
         c_mod.linkLibrary(raylib);
         b.modules.put(b.graph.arena, "raygui", c_mod) catch @panic("OOM");
     }
@@ -592,13 +759,20 @@ fn translateCMod(
     optimize: std.builtin.OptimizeMode,
     raylib: *std.Build.Step.Compile,
 ) void {
-    const c = b.addTranslateC(.{
-        .root_source_file = b.path("src/" ++ header ++ ".h"),
+    const source = if (comptime std.mem.eql(u8, header, "rcamera"))
+        b.addWriteFiles().add("rcamera-wrapper.h", "#include \"raylib.h\"\n#include \"rcamera.h\"\n")
+    else
+        b.path("src/" ++ header ++ ".h");
+    const c: Translator = .init(b.dependency("translate_c", .{}), .{
+        .name = header,
+        .c_source_file = source,
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .libc_file = raylib.libc_file,
     });
-    const c_mod = c.createModule();
+    c.addIncludePath(b.path("src"));
+    const c_mod = c.mod;
     c_mod.linkLibrary(raylib);
     b.modules.put(b.graph.arena, header, c_mod) catch @panic("OOM");
 }
@@ -617,6 +791,17 @@ pub fn build(b: *std.Build) !void {
 
     b.installArtifact(lib);
 
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_tests = b.addRunArtifact(tests);
+    run_tests.cwd = tests.getEmittedBin().dirname();
+    b.step("test", "Test Zig build helpers").dependOn(&run_tests.step);
+
     translateCMod("raylib", b, target, optimize, lib);
     translateCMod("rcamera", b, target, optimize, lib);
     translateCMod("raymath", b, target, optimize, lib);
@@ -626,15 +811,43 @@ pub fn build(b: *std.Build) !void {
         addRaygui(b, target, optimize, lib);
     }
 
+    const module_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/headers.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "raylib", .module = b.modules.get("raylib").? },
+                .{ .name = "rcamera", .module = b.modules.get("rcamera").? },
+                .{ .name = "raymath", .module = b.modules.get("raymath").? },
+            },
+        }),
+    });
+    if (target.result.abi.isAndroid()) {
+        for (lib.root_module.lib_paths.items) |library_path| {
+            module_tests.root_module.addLibraryPath(library_path);
+        }
+        module_tests.setLibCFile(lib.libc_file);
+    }
+    const test_modules = b.step("test-modules", "Test the translated camera and math modules");
+    if (target.result.cpu.arch == b.graph.host.result.cpu.arch and
+        target.result.os.tag == b.graph.host.result.os.tag and
+        target.result.abi == b.graph.host.result.abi)
+    {
+        test_modules.dependOn(&b.addRunArtifact(module_tests).step);
+    } else {
+        test_modules.dependOn(&module_tests.step);
+    }
+
     const examples = b.step("examples", "build/install all examples");
-    examples.dependOn(try addExamples("core", b, target, optimize, lib, options.platform));
-    examples.dependOn(try addExamples("audio", b, target, optimize, lib, options.platform));
-    examples.dependOn(try addExamples("models", b, target, optimize, lib, options.platform));
-    examples.dependOn(try addExamples("shaders", b, target, optimize, lib, options.platform));
-    examples.dependOn(try addExamples("shapes", b, target, optimize, lib, options.platform));
-    examples.dependOn(try addExamples("text", b, target, optimize, lib, options.platform));
-    examples.dependOn(try addExamples("textures", b, target, optimize, lib, options.platform));
-    examples.dependOn(try addExamples("others", b, target, optimize, lib, options.platform));
+    examples.dependOn(try addExamples("core", b, target, optimize, lib, options));
+    examples.dependOn(try addExamples("audio", b, target, optimize, lib, options));
+    examples.dependOn(try addExamples("models", b, target, optimize, lib, options));
+    examples.dependOn(try addExamples("shaders", b, target, optimize, lib, options));
+    examples.dependOn(try addExamples("shapes", b, target, optimize, lib, options));
+    examples.dependOn(try addExamples("text", b, target, optimize, lib, options));
+    examples.dependOn(try addExamples("textures", b, target, optimize, lib, options));
+    examples.dependOn(try addExamples("others", b, target, optimize, lib, options));
 }
 
 fn addExamples(
@@ -643,12 +856,14 @@ fn addExamples(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     raylib: *std.Build.Step.Compile,
-    platform: PlatformBackend,
+    options: Options,
 ) !*std.Build.Step {
+    const platform = options.platform;
     const all = b.step(module, "All " ++ module ++ " examples");
     const module_subpath = b.pathJoin(&.{ "examples", module });
 
-    var dir = try b.build_root.handle.openDir(b.graph.io, module_subpath, .{ .iterate = true });
+    b.dependOnDirectoryContents(b.path(module_subpath));
+    var dir = try b.root.openDir(b.graph.io, module_subpath, .{ .iterate = true });
     defer dir.close(b.graph.io);
 
     var iter = dir.iterate();
@@ -667,7 +882,12 @@ fn addExamples(
             .link_libc = true,
         });
         exe_mod.addCSourceFile(.{ .file = b.path(path) });
-        exe_mod.linkLibrary(raylib);
+        if (platform != .android) exe_mod.linkLibrary(raylib);
+        if (target.result.abi.isAndroid() and platform != .android) {
+            for (raylib.root_module.lib_paths.items) |library_path| {
+                exe_mod.addLibraryPath(library_path);
+            }
+        }
 
         if (platform == .sdl) {
             exe_mod.linkSystemLibrary("SDL2", .{});
@@ -718,13 +938,19 @@ fn addExamples(
             const html_filename = try std.fmt.allocPrint(b.allocator, "{s}.html", .{wasm.name});
             const emrun_step = emsdk.emrunStep(
                 b,
-                b.getInstallPath(install_dir, html_filename),
+                b.graph.path(.install_prefix, b.pathJoin(&.{ install_dir.custom, html_filename })),
                 &.{},
             );
 
             emrun_step.dependOn(emcc_step);
             run_step.dependOn(emrun_step);
             all.dependOn(emcc_step);
+        } else if (platform == .android) {
+            const activity = android.addNativeActivity(b, filename, exe_mod, raylib, options.android_ndk);
+            const install = android.installNativeActivity(b, activity, module);
+            b.getInstallStep().dependOn(&install.step);
+            run_step.dependOn(&install.step);
+            all.dependOn(&install.step);
         } else {
             exe_mod.addCMacro("PLATFORM_DESKTOP", "");
 
@@ -733,6 +959,9 @@ fn addExamples(
                 .root_module = exe_mod,
                 .use_lld = target.result.os.tag == .windows,
             });
+            if (target.result.abi.isAndroid()) {
+                exe.setLibCFile(raylib.libc_file);
+            }
             b.installArtifact(exe);
 
             const install_cmd = b.addInstallArtifact(exe, .{ .dest_sub_path = b.fmt("{s}/{s}", .{ module, filename }) });
@@ -754,7 +983,8 @@ fn waylandGenerate(
     comptime waylandDir: []const u8,
     comptime source: bool,
 ) !void {
-    const dir = try b.build_root.handle.openDir(b.graph.io, waylandDir, .{ .iterate = true });
+    b.dependOnDirectoryContents(b.path(waylandDir));
+    const dir = try b.root.openDir(b.graph.io, waylandDir, .{ .iterate = true });
     defer dir.close(b.graph.io);
 
     var iter = dir.iterate();
