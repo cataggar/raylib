@@ -45,7 +45,13 @@
         #endif
         #define GLSL_VERSION            330
     #endif
-#else   // PLATFORM_ANDROID, PLATFORM_WEB
+#elif defined(PLATFORM_ANDROID)
+    #include <GLES2/gl2.h>
+    #ifndef GRAPHICS_API_OPENGL_ES2
+        #define GRAPHICS_API_OPENGL_ES2
+    #endif
+    #define GLSL_VERSION            100
+#else   // PLATFORM_WEB
     #define GLSL_VERSION            100
 #endif
 
@@ -76,11 +82,41 @@ int main(void)
 
     InitWindow(screenWidth, screenHeight, "raylib [others] example - OpenGL interoperatibility");
 
+#if defined(PLATFORM_ANDROID)
+    if (!IsWindowReady())
+    {
+        TraceLog(LOG_ERROR, "INTEROP: Android EGL context initialization failed");
+        return 1;
+    }
+#endif
+
     Shader shader = LoadShader(TextFormat("resources/shaders/glsl%i/point_particle.vs", GLSL_VERSION),
                                TextFormat("resources/shaders/glsl%i/point_particle.fs", GLSL_VERSION));
 
+#if defined(PLATFORM_ANDROID)
+    if (!IsShaderValid(shader) || (shader.locs == NULL))
+    {
+        TraceLog(LOG_ERROR, "INTEROP: GLSL100 particle shader is unavailable");
+        UnloadShader(shader);
+        CloseWindow();
+        return 1;
+    }
+#endif
+
     int currentTimeLoc = GetShaderLocation(shader, "currentTime");
     int colorLoc = GetShaderLocation(shader, "color");
+
+#if defined(PLATFORM_ANDROID)
+    if ((shader.locs[SHADER_LOC_VERTEX_POSITION] < 0) ||
+        (shader.locs[SHADER_LOC_MATRIX_MVP] < 0) || (currentTimeLoc < 0) || (colorLoc < 0))
+    {
+        TraceLog(LOG_ERROR, "INTEROP: Required GLSL100 particle shader or locations are unavailable");
+        UnloadShader(shader);
+        CloseWindow();
+        return 1;
+    }
+    const GLuint vertexPosition = (GLuint)shader.locs[SHADER_LOC_VERTEX_POSITION];
+#endif
 
     // Initialize the vertex buffer for the particles and assign each particle random values
     Particle particles[MAX_PARTICLES] = { 0 };
@@ -99,16 +135,57 @@ int main(void)
     // that feeds the data from the buffer into the vertexPosition shader attribute
     GLuint vao = 0;
     GLuint vbo = 0;
+#if defined(PLATFORM_ANDROID)
+    // rlgl loads OES functions only when the extension and all entrypoints are available.
+    vao = rlLoadVertexArray();
+    if (vao != 0) rlEnableVertexArray(vao);
+    else TraceLog(LOG_WARNING, "INTEROP: VAO unavailable; using GLES2 vertex attribute state");
+#else
     glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
+#endif
         glGenBuffers(1, &vbo);
+#if defined(PLATFORM_ANDROID)
+        if (vbo == 0)
+        {
+            TraceLog(LOG_ERROR, "INTEROP: GLES2 particle buffer allocation failed");
+            if (vao != 0) rlUnloadVertexArray(vao);
+            UnloadShader(shader);
+            CloseWindow();
+            return 1;
+        }
+#endif
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
         glBufferData(GL_ARRAY_BUFFER, MAX_PARTICLES*sizeof(Particle), particles, GL_STATIC_DRAW);
+#if defined(PLATFORM_ANDROID)
+        GLint bufferSize = 0;
+        glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bufferSize);
+        if (bufferSize != (GLint)sizeof(particles))
+        {
+            TraceLog(LOG_ERROR, "INTEROP: GLES2 particle buffer storage allocation failed");
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            glDeleteBuffers(1, &vbo);
+            if (vao != 0) rlUnloadVertexArray(vao);
+            UnloadShader(shader);
+            CloseWindow();
+            return 1;
+        }
+#endif
         // Note: LoadShader() automatically fetches the attribute index of "vertexPosition" and saves it in shader.locs[SHADER_LOC_VERTEX_POSITION]
+#if defined(PLATFORM_ANDROID)
+        glVertexAttribPointer(vertexPosition, 3, GL_FLOAT, GL_FALSE, 0, 0);
+        glEnableVertexAttribArray(vertexPosition);
+#else
         glVertexAttribPointer(shader.locs[SHADER_LOC_VERTEX_POSITION], 3, GL_FLOAT, GL_FALSE, 0, 0);
         glEnableVertexAttribArray(0);
+#endif
         glBindBuffer(GL_ARRAY_BUFFER, 0);
+#if defined(PLATFORM_ANDROID)
+    if (vao != 0) rlDisableVertexArray();
+    else glDisableVertexAttribArray(vertexPosition);
+#else
     glBindVertexArray(0);
+#endif
 
     // Allows the vertex shader to set the point size of each particle individually
     #ifndef GRAPHICS_API_OPENGL_ES2
@@ -145,9 +222,28 @@ int main(void)
 
                 glUniformMatrix4fv(shader.locs[SHADER_LOC_MATRIX_MVP], 1, false, MatrixToFloat(modelViewProjection));
 
+#if defined(PLATFORM_ANDROID)
+                if (vao != 0) rlEnableVertexArray(vao);
+                else
+                {
+                    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+                    glVertexAttribPointer(vertexPosition, 3, GL_FLOAT, GL_FALSE, 0, 0);
+                    glEnableVertexAttribArray(vertexPosition);
+                }
+#else
                 glBindVertexArray(vao);
+#endif
                     glDrawArrays(GL_POINTS, 0, MAX_PARTICLES);
+#if defined(PLATFORM_ANDROID)
+                if (vao != 0) rlDisableVertexArray();
+                else
+                {
+                    glDisableVertexAttribArray(vertexPosition);
+                    glBindBuffer(GL_ARRAY_BUFFER, 0);
+                }
+#else
                 glBindVertexArray(0);
+#endif
 
             glUseProgram(0);
             //------------------------------------------------------------------------------
@@ -161,7 +257,11 @@ int main(void)
     // De-Initialization
     //--------------------------------------------------------------------------------------
     glDeleteBuffers(1, &vbo);
+#if defined(PLATFORM_ANDROID)
+    if (vao != 0) rlUnloadVertexArray(vao);
+#else
     glDeleteVertexArrays(1, &vao);
+#endif
 
     UnloadShader(shader);   // Unload shader
 
