@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 /// Minimum supported version of Zig
-const min_ver = "0.16.0-dev.3013+abd131e33";
+const min_ver = "0.17.0";
 
 const emccOutputDir = "zig-out" ++ std.fs.path.sep_str ++ "htmlout" ++ std.fs.path.sep_str;
 const emccOutputFile = "index.html";
@@ -73,7 +73,7 @@ pub const emsdk = struct {
 
     pub fn emrunStep(
         b: *std.Build,
-        html_path: []const u8,
+        html_path: anytype,
         extra_args: []const []const u8,
     ) *std.Build.Step {
         return zemscripten.emrunStep(b, html_path, extra_args);
@@ -88,6 +88,36 @@ fn setDesktopPlatform(raylib: *std.Build.Step.Compile, platform: PlatformBackend
         .android => raylib.root_module.addCMacro("PLATFORM_ANDROID", ""),
         else => {},
     }
+}
+
+fn androidLibCContents(allocator: std.mem.Allocator, include_path: []const u8, api_lib_path: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    try (std.zig.LibCInstallation{
+        .include_dir = include_path,
+        .sys_include_dir = include_path,
+        .cc_dir = api_lib_path,
+        .crt_dir = api_lib_path,
+    }).render(&writer.writer);
+    return writer.toOwnedSlice();
+}
+
+test "Android libc metadata round trips through the compiler parser" {
+    const contents = try androidLibCContents(std.testing.allocator, "ndk/usr/include", "ndk/usr/lib/aarch64-linux-android/35");
+    defer std.testing.allocator.free(contents);
+    const filename = "raylib-libc-test.conf";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = filename, .data = contents });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, filename) catch {};
+    const target = try std.zig.system.resolveTargetQuery(std.testing.io, .{
+        .cpu_arch = .aarch64,
+        .os_tag = .linux,
+        .abi = .android,
+    });
+    var installation = try std.zig.LibCInstallation.parse(std.testing.allocator, std.testing.io, filename, &target);
+    defer installation.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ndk/usr/include", installation.include_dir.?);
+    try std.testing.expectEqualStrings("ndk/usr/lib/aarch64-linux-android/35", installation.crt_dir.?);
+    try std.testing.expectEqualStrings(installation.crt_dir.?, installation.cc_dir.?);
 }
 
 fn compileRaylib(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, options: Options) !*std.Build.Step.Compile {
@@ -210,6 +240,7 @@ fn compileRaylib(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
                 raylib.root_module.addCMacro("EGL_NO_X11", "");
                 raylib.root_module.addCMacro("DEFAULT_BATCH_BUFFER_ELEMENT", "");
             } else if (target.result.abi.isAndroid()) {
+                raylib.root_module.pic = true;
 
                 //these are the only tag options per https://developer.android.com/ndk/guides/other_build_systems
                 const hostTuple = switch (builtin.target.os.tag) {
@@ -246,14 +277,7 @@ fn compileRaylib(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
                 raylib.root_module.addSystemIncludePath(.{ .cwd_relative = androidAsmPath });
                 raylib.root_module.addSystemIncludePath(.{ .cwd_relative = androidGluePath });
 
-                var libcData: std.ArrayList(u8) = .empty;
-                var aw: std.Io.Writer.Allocating = .fromArrayList(b.allocator, &libcData);
-                try (std.zig.LibCInstallation{
-                    .include_dir = androidIncludePath,
-                    .sys_include_dir = androidIncludePath,
-                    .crt_dir = androidApiSpecificPath,
-                }).render(&aw.writer);
-                const libcFile = b.addWriteFiles().add("android-libc.txt", try libcData.toOwnedSlice(b.allocator));
+                const libcFile = b.addWriteFiles().add("android-libc.txt", try androidLibCContents(b.allocator, androidIncludePath, androidApiSpecificPath));
                 raylib.setLibCFile(libcFile);
 
                 if (options.opengl_version == .auto) {
@@ -261,6 +285,8 @@ fn compileRaylib(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
                     raylib.root_module.addCMacro("GRAPHICS_API_OPENGL_ES2", "");
                 }
                 raylib.root_module.linkSystemLibrary("EGL", .{});
+                raylib.root_module.linkSystemLibrary("android", .{});
+                raylib.root_module.linkSystemLibrary("log", .{});
 
                 setDesktopPlatform(raylib, .android);
             } else {
@@ -283,7 +309,7 @@ fn compileRaylib(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
                 }
 
                 if (options.linux_display_backend == .Wayland or options.linux_display_backend == .Both) {
-                    _ = b.findProgram(&.{"wayland-scanner"}, &.{}) catch {
+                    _ = b.findProgram(.{ .names = &.{"wayland-scanner"} }) orelse {
                         std.log.err(
                             \\ `wayland-scanner` may not be installed on the system.
                             \\ You can switch to X11 in your `build.zig` by changing `Options.linux_display_backend`
@@ -464,6 +490,15 @@ pub fn build(b: *std.Build) !void {
 
     b.installArtifact(lib);
 
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    b.step("test", "Test Zig build helpers").dependOn(&b.addRunArtifact(tests).step);
+
     const examples = b.step("examples", "Build/Install all examples");
     examples.dependOn(try addExamples("audio", b, target, optimize, lib));
     examples.dependOn(try addExamples("core", b, target, optimize, lib));
@@ -485,7 +520,8 @@ fn addExamples(
     const all = b.step(module, "All " ++ module ++ " examples");
     const module_subpath = b.pathJoin(&.{ "examples", module });
 
-    var dir = try std.Io.Dir.cwd().openDir(b.graph.io, b.pathFromRoot(module_subpath), .{ .iterate = true });
+    b.dependOnDirectoryContents(b.path(module_subpath));
+    var dir = try b.root.openDir(b.graph.io, module_subpath, .{ .iterate = true });
     defer dir.close(b.graph.io);
 
     var iter = dir.iterate();
@@ -544,7 +580,7 @@ fn addExamples(
             const html_filename = try std.fmt.allocPrint(b.allocator, "{s}.html", .{wasm.name});
             const emrun_step = emsdk.emrunStep(
                 b,
-                b.getInstallPath(install_dir, html_filename),
+                b.graph.path(.install_prefix, b.pathJoin(&.{ "htmlout", html_filename })),
                 &.{"--no_browser"},
             );
             emrun_step.dependOn(emcc_step);
@@ -643,7 +679,7 @@ fn hasCSource(module: *std.Build.Module, name: []const u8) bool {
     for (module.link_objects.items) |o| switch (o) {
         .c_source_file => |c| if (switch (c.file) {
             .src_path => |s| std.ascii.endsWithIgnoreCase(s.sub_path, name),
-            .generated, .cwd_relative, .dependency => false,
+            .generated, .cwd_relative, .dependency, .relative => false,
         }) return true,
         .c_source_files => |s| for (s.files) |c| if (std.ascii.endsWithIgnoreCase(c, name)) return true,
         else => {},

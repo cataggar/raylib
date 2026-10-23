@@ -101,6 +101,30 @@ raylib is also available via multiple package managers on multiple OS distributi
 
 *Note that the Wiki is open for edit, if you find some issues while building raylib for your target platform, feel free to edit the Wiki or open an issue related to it.*
 
+#### Building with Zig
+
+The Zig build package requires Zig 0.17.0 and retains the raylib 5.6-dev C API.
+`zig build` installs the library and headers, `zig build examples` builds all
+examples, and `zig build test` tests the build helpers. Desktop backend and
+feature options remain available through `zig build --help`.
+
+For Android, pass an NDK directory with `-Dandroid_ndk` or `ANDROID_NDK_HOME`
+and select an Android target, for example `-Dtarget=aarch64-linux-android`.
+`-Dandroid_api_version` defaults to `35`. The existing static library and
+NativeActivity glue integration are unchanged. Emscripten builds retain the
+`htmlout` installation directory and the `emrun` example entrypoints.
+Android library objects are position-independent for shared NativeActivity
+consumers and record their `android`, `log`, `EGL`, and `GLESv2` dependencies.
+
+The Zig dependency pins preserve the default-output Emscripten helper
+generation; the helper's custom-output generation is a separate package edge.
+
+| Dependency | Version | Source |
+| --- | --- | --- |
+| zemscripten | 0.2.0-dev | `cataggar/zemscripten` at `41f772b0fb097b25340103cd6ce3c49c855e9a69` |
+| emsdk | 4.0.9 | `emscripten-core/emsdk` tag `4.0.9` |
+| xcode-frameworks | Pinned bundle | `8a1cfb373587ea4c9bb1468b7c986462d8d4e10e` |
+
 #### Setup raylib with multiple IDEs
 
 raylib has been developed on Windows platform using [Notepad++](https://notepad-plus-plus.org/) and [MinGW GCC](https://www.mingw-w64.org/) compiler but it can be used with other IDEs on multiple platforms.
