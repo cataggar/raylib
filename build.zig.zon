@@ -1,7 +1,7 @@
 .{
     .name = .raylib,
     .version = "5.6.0-dev",
-    .minimum_zig_version = "0.15.1",
+    .minimum_zig_version = "0.17.0",
 
     .fingerprint = 0x13035e5cb8bc1ac2, // Changing this has security and trust implications.
 
@@ -16,8 +16,8 @@
             .hash = "N-V-__8AAJl1DwBezhYo_VE6f53mPVm00R-Fk28NPW7P14EQ",
         },
         .zemscripten = .{
-            .url = "git+https://github.com/zig-gamedev/zemscripten#3fa4b778852226c7346bdcc3c1486e875a9a6d02",
-            .hash = "zemscripten-0.2.0-dev-sRlDqApRAACspTbAZnuNKWIzfWzSYgYkb2nWAXZ-tqqt",
+            .url = "git+https://github.com/cataggar/zemscripten#41f772b0fb097b25340103cd6ce3c49c855e9a69",
+            .hash = "zemscripten-0.2.0-dev-sRlDqPZTAACcL6NMgwhY4rh-YH7C-0G_tjouhRntBKga",
         },
     },
 
